@@ -6,6 +6,20 @@ from sklearn.preprocessing import FunctionTransformer, QuantileTransformer
 from torch.utils.data import Dataset
 
 
+def build_vocab(encounters, key="inputs", add_cls_pad=True):
+    names = set()
+    for es in encounters:
+        for e in es:
+            names.update(e[key].keys())
+    if add_cls_pad:
+        measurement_vocab = {name: i + 2 for i, name in enumerate(sorted(names))}
+        measurement_vocab["<CLS>"] = 1
+        measurement_vocab["<PAD>"] = 0
+    else:
+        measurement_vocab = {name: i for i, name in enumerate(sorted(names))}
+    return measurement_vocab
+
+
 def create_pipeline():
     return Pipeline(
         [

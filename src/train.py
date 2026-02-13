@@ -1,12 +1,8 @@
-import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
 import torch.optim as optim
-
-# from pytorch_lightning.callbacks import ModelCheckpoint
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import QuantileTransformer
+from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader
 from torchmetrics.functional import auroc
 
@@ -27,7 +23,7 @@ class LitTemporalTransformer(pl.LightningModule):
 
     def compute_loss(self, out, batch):
         loss_cls = self.criterion(out["pred_cls"], batch["labels"])
-        loss = loss_cls + 1.0 * out["loss_pc"]
+        loss = loss_cls + 1.0 * out["loss_pc"] + 1.0 * out["loss_rec"]
         out["loss"] = loss
         out["loss_cls"] = loss_cls
         return out
@@ -133,7 +129,7 @@ class LitTemporalTransformer(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=1e-3)
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.95)
         return {
             "optimizer": optimizer,
             "lr_scheduler": scheduler,
@@ -141,101 +137,7 @@ class LitTemporalTransformer(pl.LightningModule):
         }
 
 
-if __name__ == "__main__":
-    fn_cbc = "/workspace/ehr_setpoint/cbc_cdmdeid_demo_100k.parquet"
-    fn_demo = "/workspace/ehr_setpoint/demography_cdmdeid.parquet"
-    fn_cond = "/workspace/ehr_setpoint/condition_occur_BI_CV_EM.parquet"
-    fn_icd2snomed = "/workspace/ehr_setpoint/icd2snomed.parquet"
-    df = pd.read_parquet(fn_cbc)
-    df_demo = pd.read_parquet(fn_demo)
-    df_cond = pd.read_parquet(fn_cond)
-    df_icd2snomed = pd.read_parquet(fn_icd2snomed)
-    
-    qt = QuantileTransformer(
-        n_quantiles=1000,  # more quantiles = smoother ranks
-        output_distribution="uniform",
-        subsample=50000,
-    )
-
-    visit_types = set(
-        [
-            "Outpatient Hospital",
-            "Outpatient Visit",
-        ]
-    )
-    df = df[df.VISIT_TYPE.isin(visit_types)]
-    id2feature = [
-        "3000905",
-        "3004327",
-        "3008342",
-        "3011948",
-        "3013429",
-        "3013650",
-        "3013869",
-        "3020416",
-        "3023314",
-        "3024929",
-        "3028615",
-        "3033575",
-        "3037511",
-        "3043111",
-        "3023599",
-        "3019897",
-        "3000963",
-    ]
-
-    df["age"] = np.round(df["age_days"] / 365).astype(int)
-    df["age_quarter"] = np.round(df["age_days"] / 91.25).astype(int)
-
-    df["norm_value"] = df.groupby("MEASUREMENT_CONCEPT_ID")[
-        "VALUE_AS_NUMBER"
-    ].transform(lambda x: qt.fit_transform(x.values.reshape(-1, 1))[:, 0])
-    person_ids = set(df.PERSON_ID)
-
-    df_cond = df_cond[df_cond.PERSON_ID.isin(person_ids)]
-    d = df_icd2snomed[
-        [
-            c.startswith("CV") or c.startswith("BI") or c.startswith("EM")
-            for c in df_icd2snomed.category
-        ]
-    ]
-    df_merge = df_cond.merge(
-        d[
-            ["SNOMED_CONCEPT_ID", "SNOMED_NAME", "category", "phecode"]
-        ].drop_duplicates(),
-        right_on="SNOMED_CONCEPT_ID",
-        left_on="CONDITION_CONCEPT_ID",
-    )
-    
-    df_merge = df_merge.merge(df_demo, on="PERSON_ID")
-    df_merge["CONDITION_START_DATE"] = pd.to_datetime(df_merge["CONDITION_START_DATE"])
-    diff = df_merge.CONDITION_START_DATE - df_merge.BIRTH_DATETIME.dt.to_pydatetime()
-    df_merge["age_days"] = [d.days for d in diff]
-    df_merge = df_merge[df_merge.age_days >= 0]
-    df_merge["age"] = np.round(df_merge["age_days"] / 365).astype(int)
-    df_merge["age_quarter"] = np.round(df_merge["age_days"] / 91.25).astype(int)
-    df_code = df_merge[["PERSON_ID", "age_quarter", "category"]].drop_duplicates()
-    df = (
-        df.groupby(["age_quarter", "PERSON_ID", "MEASUREMENT_CONCEPT_ID"])["norm_value"]
-        .mean()
-        .reset_index()
-    )
-    df = df[df.age_quarter > 72]
-    pid2event_info = {
-        p: {c: set(d.age_quarter) for c, d in d.groupby("category")}
-        for p, d in df_code.groupby("PERSON_ID")
-    }
-
-    df_demo = df_demo[df_demo.PERSON_ID.isin(person_ids)]
-    pid2demo = {}
-
-    for p, d in df_demo.groupby("PERSON_ID"):
-        rec = {}
-        gender = d.GENDER_CONCEPT_NAME.iloc[0]
-        rec[f"gender_{gender}"] = 0
-        race = d.RACE_CONCEPT_NAME.iloc[0]
-        rec[f"race_{race}"] = 0
-
+def build_encounters(df, pid2demo, pid2event_info):
     encounters_all = []
     eventtime_all = []
 
@@ -251,7 +153,7 @@ if __name__ == "__main__":
                 fea_static = pid2demo[p]
 
             fea_input = {**fea_dyn, **fea_static}
-
+            # fea_input = fea_dyn
             fea_rec = fea_dyn
             encounters.append({"time": t, "inputs": fea_input, "outputs": fea_rec})
             last_t = max(last_t, t)
@@ -263,74 +165,161 @@ if __name__ == "__main__":
         if p in pid2event_info:
             event_info = pid2event_info[p]
         eventtime_all.append(event_info)
-        # labels_all.append([fn2label[p]])
 
-    meas_vocabs = build_vocab(encounters_all)
-    output_vocabs = build_vocab(encounters_all, key="outputs", add_cls_pad=False)
+    return encounters_all, eventtime_all
+
+
+def get_pid2event_info(df):
+    grouped = df.groupby(["PERSON_ID", "category"])["age_quarter"].unique()
+    pid2event_info = {}
+    for (pid, cat), values in grouped.items():
+        if pid not in pid2event_info:
+            pid2event_info[pid] = {}
+        pid2event_info[pid][cat] = set(values.tolist())
+    return pid2event_info
+
+
+def get_pid2demo(df):
+    return {
+        row.PERSON_ID: {
+            f"gender_{row.GENDER_CONCEPT_NAME}": 0,
+            f"race_{row.RACE_CONCEPT_NAME}": 0,
+        }
+        for row in df.itertuples(index=False)
+    }
+
+
+def build_loaders(
+    df,
+    df_demo,
+    df_code,
+    batch_size_train=64,
+    batch_size_eval=16,
+    train_size=0.7,
+    random_state=1,
+    num_workers=16,
+    p_drop_encounter=0.9,
+    p_drop_meas=0.9,
+):
+    """
+    Build vocabularies, split data, create datasets, and return dataloaders.
+    Minimizes input variables from the user.
+    """
+    pid2event_info = get_pid2event_info(df_code)
+    pid2demo = get_pid2demo(df_demo)
+
+    train_enc, train_evt = build_encounters(
+        df[df.split == "train"], pid2demo, pid2event_info
+    )
+    val_enc, val_evt = build_encounters(df[df.split == "val"], pid2demo, pid2event_info)
+    test_enc, test_evt = build_encounters(
+        df[df.split == "test"], pid2demo, pid2event_info
+    )
+    # ----- Vocabs -----
+    meas_vocabs = build_vocab(train_enc)
+    output_vocabs = build_vocab(train_enc, key="outputs", add_cls_pad=False)
+    _vocab = build_vocab(val_enc, key="outputs", add_cls_pad=False)
+    diff = set(_vocab.keys()) - set(output_vocabs.keys())
+    assert len(diff) == 0, f"{diff} not in train outputs"
+    diff = set(_vocab.keys()) - set(output_vocabs.keys())
+    assert len(diff) == 0, f"{diff} not in train outputs"
+    # ----- Label mapping -----
     id2phecode = sorted(set(df_code.category))
-    random_state = 1
-    train_inds, test_inds = train_test_split(
-        np.arange(len(encounters_all)),
-        train_size=0.7,
-        random_state=random_state,
-    )
 
-    val_inds, test_ind = train_test_split(
-        test_inds, train_size=0.5, random_state=random_state
-    )
-
-    train_encounters = [encounters_all[i] for i in train_inds]
-    train_event_infos = [eventtime_all[i] for i in train_inds]
-    val_encounters = [encounters_all[i] for i in val_inds]
-    val_event_infos = [eventtime_all[i] for i in val_inds]
-    test_encounters = [encounters_all[i] for i in test_inds]
-    test_event_infos = [eventtime_all[i] for i in test_inds]
-
+    # ----- Datasets -----
     train_dataset = EventTimeDataset(
-        train_encounters, meas_vocabs, output_vocabs, train_event_infos, id2phecode
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=64,
-        shuffle=False,
-        collate_fn=EventTimeDataset.collate_events,
-        num_workers=16,
+        train_enc,
+        meas_vocabs,
+        output_vocabs,
+        train_evt,
+        id2phecode,
+        p_drop_encounter=p_drop_encounter,
+        p_drop_meas=p_drop_meas,
     )
     val_dataset = EventTimeDataset(
-        val_encounters, meas_vocabs, output_vocabs, val_event_infos, id2phecode
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=16,
-        shuffle=False,
-        collate_fn=EventTimeDataset.collate_events,
-        num_workers=16,
+        val_enc, meas_vocabs, output_vocabs, val_evt, id2phecode
     )
     test_dataset = EventTimeDataset(
-        test_encounters, meas_vocabs, output_vocabs, test_event_infos, id2phecode
+        test_enc, meas_vocabs, output_vocabs, test_evt, id2phecode
     )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=16,
+
+    # ----- Loaders -----
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size_train,
+        shuffle=True,
+        collate_fn=EventTimeDataset.collate_events,
+        num_workers=num_workers,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size_eval,
         shuffle=False,
         collate_fn=EventTimeDataset.collate_events,
-        num_workers=16,
+        num_workers=num_workers,
     )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size_eval,
+        shuffle=False,
+        collate_fn=EventTimeDataset.collate_events,
+        num_workers=num_workers,
+    )
+
+    return {
+        "train_loader": train_loader,
+        "val_loader": val_loader,
+        "test_loader": test_loader,
+        "meas_vocabs": meas_vocabs,
+        "output_vocabs": output_vocabs,
+        "id2phecode": id2phecode,
+    }
+
+
+if __name__ == "__main__":
+    df = pd.read_parquet("./train_cbc_v1.parquet")
+    df_demo = pd.read_parquet("./train_demo_cbc_v1.parquet")
+    df_code = pd.read_parquet("./train_cbc_outcome_v1.parquet")
+
+    datasets_info = build_loaders(
+        df,
+        df_demo,
+        df_code,
+        p_drop_meas=0.8,
+        p_drop_encounter=0.9,
+    )
+    train_loader = datasets_info["train_loader"]
+    val_loader = datasets_info["val_loader"]
+    test_loader = datasets_info["test_loader"]
+
+    dim_cls = len(datasets_info["id2phecode"])
+    dim_rec = len(datasets_info["output_vocabs"])
 
     model = LitTemporalTransformer(
         L=128,
         d_model=64,
         nhead=8,
-        dim_out=18,
-        dim_cls=len(train_dataset.event_keys),
+        dim_out=dim_rec,
+        dim_cls=dim_cls,
+    )
+
+    checkpoint_cb = ModelCheckpoint(
+        monitor="val_auroc",
+        mode="max",
+        save_top_k=1,
+        save_last=False,
+        filename="best-auroc",
     )
 
     trainer = pl.Trainer(
         max_epochs=20,
         accelerator="gpu",  # or "cpu"
         devices=1,
-        gradient_clip_val=1.0,
+        callbacks=[checkpoint_cb],
+        # gradient_clip_val=1.0,
     )
 
     trainer.fit(model, train_loader, val_dataloaders=val_loader)
-    trainer.test(model, test_loader)
+    trainer.test(model, dataloaders=test_loader, ckpt_path="best")

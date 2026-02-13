@@ -42,6 +42,16 @@ def normalize_feature(group):
     return group
 
 
+def drop_keep_two(lst, p=0.9):
+    if len(lst) <= 2:
+        return lst[:]
+
+    ind = list(range(2, len(lst) + 1))[::-1]
+    weights = [p**i for i in range(len(ind))]
+    keep_n = random.choices(ind, weights=weights, k=1)[0]
+    return lst[:keep_n]
+
+
 class EventTimeDataset(Dataset):
     def __init__(
         self,
@@ -51,6 +61,8 @@ class EventTimeDataset(Dataset):
         event_infos=None,
         event_keys=None,
         max_measurements=128,
+        p_drop_encounter=None,
+        p_drop_meas=None,
     ):
         """
         events: list of dicts:
@@ -58,6 +70,8 @@ class EventTimeDataset(Dataset):
             - "measurements": dict {measurement_name: value}
         """
         self.encounters = encounters
+        self.p_drop_encounter = p_drop_encounter
+        self.p_drop_meas = p_drop_meas
 
         if event_infos is not None:
             assert len(encounters) == len(event_infos)
@@ -81,15 +95,20 @@ class EventTimeDataset(Dataset):
         Convert dict -> list of ids and list of values
         (no padding done here)
         """
+
+        # add cls token
         ids = [self.cls_token]
         vals = [0]
 
         for name, v in meas_dict.items():
             if name not in self.measurement_vocab:
                 continue
-            if random.random() > 0.9:
-                continue
-            mid = self.measurement_vocab[name]  # FIXED
+
+            if self.p_drop_meas is not None:
+                if random.random() > self.p_drop_meas:
+                    continue
+
+            mid = self.measurement_vocab[name]
             ids.append(mid)
             vals.append(float(v))
 
@@ -100,7 +119,7 @@ class EventTimeDataset(Dataset):
         for d in self.event_keys:
             label = 0
             if d in event_info:
-                label = self.is_in_between(event_info[d], t0, t1)
+                label = self.is_in_between(event_info[d], t0 - 4, t1 + 4)
             labels += [label]
         return {"labels": labels}
 
@@ -111,8 +130,20 @@ class EventTimeDataset(Dataset):
         encounters = self.encounters[idx]
         event_info = self.event_infos[idx]
         outs = []
+
+        if self.p_drop_encounter is not None:
+            encounters = drop_keep_two(encounters, self.p_drop_encounter)
+
         for encounter in encounters:
             meas_ids, meas_vals = self.encode_measurements(encounter["inputs"])
+            output_rec = [0] * len(self.rec_vocabs)
+            output_rec_mask = [False] * len(self.rec_vocabs)
+            for o, v in encounter["inputs"].items():
+                if o not in self.rec_vocabs:
+                    continue
+                output_rec[self.rec_vocabs[o]] = v
+                output_rec_mask[self.rec_vocabs[o]] = True
+
             output = [0] * len(self.rec_vocabs)
             output_mask = [False] * len(self.rec_vocabs)
             for o, v in encounter["outputs"].items():
@@ -125,6 +156,8 @@ class EventTimeDataset(Dataset):
                 "meas_vals": meas_vals,
                 "outputs": output,
                 "output_mask": output_mask,
+                "outputs_rec": output_rec,
+                "output_rec_mask": output_rec_mask,
             }
             outs.append(out)
         outs = sorted(outs, key=lambda x: x["time"])
@@ -169,6 +202,8 @@ class EventTimeDataset(Dataset):
         pad_masks = []
         outputs = []
         output_mask = []
+        outputs_rec = []
+        output_rec_mask = []
         # Find PAD token from any one sample
         pad_token = 0  # always 0 based on vocabulary construction
 
@@ -178,28 +213,35 @@ class EventTimeDataset(Dataset):
             L = len(ids)
             pad_len = max_len - L
 
-            padded_ids.append(
-                torch.tensor(ids + [pad_token] * pad_len, dtype=torch.long)
-            )
-            padded_vals.append(torch.tensor(vals + [0.0] * pad_len, dtype=torch.float))
-            pad_masks.append(
-                torch.tensor([True] * L + [False] * pad_len, dtype=torch.bool)
-            )
+            padded_ids.append(ids + [pad_token] * pad_len)
+            padded_vals.append(vals + [0.0] * pad_len)
+            pad_masks.append([False] * L + [True] * pad_len)
             outputs.append(item["outputs"])
             output_mask.append(item["output_mask"])
+            outputs_rec.append(item["outputs_rec"])
+            output_rec_mask.append(item["output_rec_mask"])
 
         outputs = torch.tensor(outputs, dtype=torch.float)
         output_mask = torch.tensor(output_mask, dtype=torch.bool)
+
+        outputs_rec = torch.tensor(outputs_rec, dtype=torch.float)
+        output_rec_mask = torch.tensor(output_rec_mask, dtype=torch.bool)
+
+        padded_ids = torch.tensor(padded_ids, dtype=torch.long)
+        padded_vals = torch.tensor(padded_vals, dtype=torch.float)
+        pad_masks = torch.tensor(pad_masks, dtype=torch.bool)
 
         return {
             "sample_ids": sample_ids,  # (B,)
             "time_vals": times,  # (B,)
             "time_ids": time_ids,  # (B,)
-            "meas_ids": torch.stack(padded_ids),  # (B, max_len)
-            "meas_vals": torch.stack(padded_vals),  # (B, max_len)
-            "pad_masks": torch.stack(pad_masks),  # (B, max_len)
+            "meas_ids": padded_ids,  # (B, max_len)
+            "meas_vals": padded_vals,  # (B, max_len)
+            "pad_masks": pad_masks,  # (B, max_len)
             "outputs": outputs,
             "output_mask": output_mask,
+            "outputs_rec": outputs_rec,
+            "output_rec_mask": output_rec_mask,
             "batch_size": batch_size,
             **event_outputs,
         }

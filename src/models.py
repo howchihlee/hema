@@ -20,10 +20,7 @@ def positional_encoding(time_vals: torch.Tensor, d_model: int):
     return pe
 
 
-def pivot_tensor(
-    dims, device, sample_ids, time_ids, list_vals_to_fill, dtype=torch.float32
-):
-    tensor_to_pivot = torch.zeros(dims, device=device, dtype=dtype)
+def pivot_tensor(tensor_to_pivot, sample_ids, time_ids, list_vals_to_fill):
     n = len(list_vals_to_fill)
 
     for i, val in enumerate(list_vals_to_fill):
@@ -40,22 +37,25 @@ class TemporalTransformer(nn.Module):
 
         self.emb_layer = nn.Embedding(L, d_model)
 
-        self.enc_layer = nn.TransformerEncoderLayer(
+        enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             activation="gelu",
             batch_first=True,
         )
+        self.encounter_encoder = nn.TransformerEncoder(enc_layer, num_layers=2)
 
-        self.pred_emb = nn.Parameter(torch.randn(1, d_model))
+        self.pred_emb = nn.Parameter(torch.randn(1, 1, d_model))
         self.val_emb = nn.Parameter(torch.randn(1, 1, d_model))
         self.cls_emb = nn.Parameter(torch.randn(1, 1, d_model))
 
-        self.enc_layer_visit = nn.TransformerEncoderLayer(
+        enc_layer_visit = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             batch_first=True,
         )
+
+        self.traj_encoder = nn.TransformerEncoder(enc_layer_visit, num_layers=2)
 
         self.f_obs = nn.Linear(d_model, dim_out)
         self.f_cls = nn.Linear(d_model, dim_cls)
@@ -80,7 +80,9 @@ class TemporalTransformer(nn.Module):
         # --- Embedding of measurements ---
         meas_embs = self.emb_layer(batch["meas_ids"])  # (N,M,d_model)
         meas_embs = meas_embs + batch["meas_vals"].unsqueeze(-1) * self.val_emb
-        meas_embs = self.enc_layer(meas_embs)  # (N,M,d_model)
+        meas_embs = self.encounter_encoder(
+            meas_embs, src_key_padding_mask=batch["pad_masks"]
+        )  # (N,M,d_model)
 
         device = meas_embs.device
         # --- Time encoding ---
@@ -88,73 +90,90 @@ class TemporalTransformer(nn.Module):
         # pos_emb_t0 = torch.zeros((B, seq_time, self.d_model), device=device)
         # pos_emb_t0[batch['sample_ids'], batch['time_ids']] = pos_emb
         dims = (B, seq_time, self.d_model)
+        pos_emb_t0 = torch.zeros(dims, device=device, dtype=torch.float)
         pos_emb_t0 = pivot_tensor(
-            dims, device, batch["sample_ids"], batch["time_ids"], [pos_emb]
+            pos_emb_t0, batch["sample_ids"], batch["time_ids"], [pos_emb]
         )
 
+        # --- Masking ---
+        dims = (B, 2 * seq_time)
+        mask_per_patient = torch.ones(dims, device=device, dtype=torch.bool)
+        mask_per_patient = pivot_tensor(
+            mask_per_patient,
+            batch["sample_ids"],
+            batch["time_ids"],
+            [False, False],
+        )
+
+        # --- per patient embedding
         dims = (B, 2 * seq_time, self.d_model)
+        out_per_patient = torch.zeros(dims, device=device, dtype=torch.float)
         out_per_patient = pivot_tensor(
-            dims,
-            device,
+            out_per_patient,
             batch["sample_ids"],
             batch["time_ids"],
             [meas_embs[:, 0, :], meas_embs[:, 0, :]],
         )
 
-        # Insert event embeddings to even/odd positions
-        # out_per_patient[batch['sample_ids'], 2 * batch['time_ids']] = meas_embs[:, 0, :]
-        # out_per_patient[batch['sample_ids'], 2 * batch['time_ids'] + 1] = meas_embs[:, 0, :]
-
         # Add alternating positional encodings
         out_per_patient[:, ::2, :] += pos_emb_t0
         out_per_patient[:, 1:-1:2, :] += pos_emb_t0[:, 1:] + self.pred_emb
-        out_per_patient[:, [-1], :] += pos_emb_t0[:, [-1]] + self.cls_emb
-
-        # --- Masking ---
-        dims = (B, 2 * seq_time)
-        mask_per_patient = pivot_tensor(
-            dims,
-            device,
-            batch["sample_ids"],
-            batch["time_ids"],
-            [False, False],
-            dtype=torch.bool,
-        )
-        # mask_per_patient[batch['sample_ids'], 2 * batch['time_ids']] = False
-        # mask_per_patient[batch['sample_ids'], 2 * batch['time_ids'] + 1] = False
+        # out_per_patient[batch_idx, last_real_idx, :] =  self.cls_emb
 
         # Output fold (ground truth)
         dims = (B, seq_time, self.dim_out)
-        # output_fold[batch['sample_ids'], batch['time_ids']] = batch["outputs"]
+        output_fold = torch.zeros(dims, device=device, dtype=torch.float)
         output_fold = pivot_tensor(
-            dims, device, batch["sample_ids"], batch["time_ids"], [batch["outputs"]]
+            output_fold, batch["sample_ids"], batch["time_ids"], [batch["outputs"]]
         )
 
-        # outputmask_fold = torch.zeros((B, seq_time, self.dim_out), dtype=torch.bool, device=device)
-        # outputmask_fold[batch['sample_ids'], batch['time_ids']] = batch["output_mask"]
+        outputmask_fold = torch.zeros(dims, device=device, dtype=torch.bool)
         outputmask_fold = pivot_tensor(
-            dims,
-            device,
+            outputmask_fold,
             batch["sample_ids"],
             batch["time_ids"],
             [batch["output_mask"]],
-            dtype=torch.bool,
+        ).float()
+
+        output_rec_fold = torch.zeros(dims, device=device, dtype=torch.float)
+        output_rec_fold = pivot_tensor(
+            output_rec_fold,
+            batch["sample_ids"],
+            batch["time_ids"],
+            [batch["outputs_rec"]],
         )
+
+        outputmask_rec_fold = torch.zeros(dims, device=device, dtype=torch.bool)
+        outputmask_rec_fold = pivot_tensor(
+            outputmask_rec_fold,
+            batch["sample_ids"],
+            batch["time_ids"],
+            [batch["output_rec_mask"]],
+        ).float()
+
         # Causal mask
         causal_mask = torch.triu(
-            torch.ones(2 * seq_time, 2 * seq_time, device=device), diagonal=1
+            torch.ones(2 * seq_time + 1, 2 * seq_time + 1, device=device), diagonal=1
         ).bool()
 
-        out2 = self.enc_layer_visit(
-            out_per_patient,
-            src_mask=causal_mask,
-            src_key_padding_mask=mask_per_patient,
+        cls_token = self.cls_emb.expand(B, -1, -1)
+        out_per_patient_cls = torch.cat(
+            [out_per_patient, cls_token], dim=1
+        )  # [B, S+1, D]
+        cls_mask = torch.ones(B, 1, dtype=mask_per_patient.dtype, device=device)
+        pad_mask_with_cls = torch.cat([mask_per_patient, cls_mask], dim=1)  # [B, S+1]
+
+        out2 = self.traj_encoder(
+            out_per_patient_cls,
+            mask=causal_mask,
+            src_key_padding_mask=pad_mask_with_cls,
             is_causal=True,
         )
 
         # Predictions
-        pred = self.f_obs(out2)  # (B, 2*seq_time, dim_out)
-        pred_cls = self.f_cls(out2[:, -1])
+        pred = self.f_obs(out2[:, :-1])  # (B, 2*seq_time, dim_out)
+        last_embs = out2[:, -1]
+        pred_cls = self.f_cls(last_embs)
 
         outputs = {
             "pred_rec": pred,
@@ -172,8 +191,16 @@ class TemporalTransformer(nn.Module):
             mask_slots = outputmask_fold[:, 1:, :]
 
             # L2 loss
-            loss_pc = torch.sum(((pred_slots - target_slots) ** 2) * mask_slots)
+            loss_pc = torch.sum(torch.abs(pred_slots - target_slots) * mask_slots)
             loss_pc = loss_pc.sum() / (mask_slots.sum() + 1e-8)
             outputs["loss_pc"] = loss_pc
 
+            pred_slots = pred[:, :-1:2, :]  # (B, seq_time-1, dim_out)
+            target_slots = output_rec_fold
+            mask_slots = outputmask_rec_fold
+
+            # L2 loss
+            loss_rec = torch.sum(torch.abs(pred_slots - target_slots) * mask_slots)
+            loss_rec = loss_rec.sum() / (mask_slots.sum() + 1e-8)
+            outputs["loss_rec"] = loss_rec
         return outputs

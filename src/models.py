@@ -29,13 +29,13 @@ def pivot_tensor(tensor_to_pivot, sample_ids, time_ids, list_vals_to_fill):
 
 
 class TemporalTransformer(nn.Module):
-    def __init__(self, L=128, d_model=32, nhead=8, dim_out=34, dim_cls=101):
+    def __init__(self, n_meas=128, d_model=32, nhead=8, dim_out=29, dim_cls=101):
         super().__init__()
 
-        self.L = L
+        self.n_meas = n_meas
         self.d_model = d_model
 
-        self.emb_layer = nn.Embedding(L, d_model)
+        self.emb_layer = nn.Embedding(n_meas, d_model)
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,

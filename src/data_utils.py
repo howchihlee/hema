@@ -69,7 +69,7 @@ class EventTimeDataset(Dataset):
 
         self.measurement_vocab = measurement_vocab
         self.rec_vocabs = rec_vocabs
-        self.tmax = 119
+        self.tmax = 120
         self.pad_token = self.measurement_vocab["<PAD>"]
         self.cls_token = self.measurement_vocab["<CLS>"]
 

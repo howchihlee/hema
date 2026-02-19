@@ -1,98 +1,66 @@
+import os
+
+import hydra
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
 import torch.optim as optim
+from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks import ModelCheckpoint
-from torch import Tensor
 from torch.utils.data import DataLoader
 from torchmetrics.functional import auroc
 
 from data_utils import EventTimeDataset
+from loss import nll_logistic_hazard
 from models import TemporalTransformer
 
 
-def _reduction(loss: Tensor, reduction: str = "mean") -> Tensor:
-    if reduction == "none":
-        return loss
-    elif reduction == "mean":
-        return loss.mean()
-    elif reduction == "sum":
-        return loss.sum()
-    raise ValueError(
-        f"`reduction` = {reduction} is not valid. Use 'none', 'mean' or 'sum'."
-    )
-
-
-def nll_logistic_hazard(
-    phi: Tensor, idx_durations: Tensor, events: Tensor, reduction: str = "mean"
-) -> Tensor:
-    """Negative log-likelihood of the discrete time hazard parametrized model LogisticHazard [1].
-
-    Arguments:
-        phi [B, num_bin] {torch.tensor, float} -- Estimates in (-inf, inf), where hazard = sigmoid(phi).
-
-        idx_durations [B], {torch.tensor, long} -- Event times represented as indices.
-        events [B], {torch.tensor, float} -- Indicator of event (1.) or censoring (0.).
-            Same length as 'idx_durations'.
-        reduction {string} -- How to reduce the loss.
-            'none': No reduction.
-            'mean': Mean of tensor.
-            'sum: sum.
-
-    Returns:
-        torch.tensor -- The negative log-likelihood.
-
-    References:
-    [1] Håvard Kvamme and Ørnulf Borgan. Continuous and Discrete-Time Survival Prediction
-        with Neural Networks. arXiv preprint arXiv:1910.06724, 2019.
-        https://arxiv.org/pdf/1910.06724.pdf
-    """
-    if phi.shape[1] <= idx_durations.max():
-        message = "Network output `phi` is too small for `idx_durations`. "
-        message += f"Need at least `phi.shape[1] = {idx_durations.max().item()+1}`, "
-        message += f"but got `phi.shape[1] = {phi.shape[1]}`"
-        raise ValueError(message)
-    if events.dtype is torch.bool:
-        events = events.float()
-    events = events.view(-1, 1)
-    idx_durations = idx_durations.view(-1, 1)
-    y_bce = torch.zeros_like(phi).scatter(1, idx_durations, events)
-    bce = F.binary_cross_entropy_with_logits(phi, y_bce, reduction="none")
-    loss = bce.cumsum(1).gather(1, idx_durations).view(-1)
-    return _reduction(loss, reduction)
-
-
 class LitTemporalTransformer(pl.LightningModule):
-    def __init__(self, **model_kwargs):
+    def __init__(self, loss_weights, model_config):
         super().__init__()
-        self.model = TemporalTransformer(**model_kwargs)
+        self.model = TemporalTransformer(**model_config)
         self.criterion = torch.nn.BCEWithLogitsLoss()
+        self.loss_weights = loss_weights
         self.val_preds = []
         self.val_targets = []
 
     def forward(self, batch):
         return self.model(batch)
 
+    def _get_weight(self, key):
+        weight = self.loss_weights.get(key)
+        if isinstance(weight, (int, float)) and weight > 0:
+            return float(weight)
+        return None
+
     def compute_loss(self, out, batch):
         loss_cls = self.criterion(out["pred_cls"], batch["labels"])
-        T = out["pred_phi"].size(-1)
-        loss_event = nll_logistic_hazard(
-            out["pred_phi"].view(-1, T), batch["duration_inds"], batch["event_inds"]
-        )
-
-        loss = loss_cls + 1.0 * out["loss_pc"] + 1.0 * out["loss_rec"]
-        loss += 1.0 * loss_event
-
-        out["loss"] = loss
         out["loss_cls"] = loss_cls
-        out["loss_event"] = loss_event
+        loss = loss_cls
+
+        # existing losses
+        for key in ["loss_pc", "loss_rec"]:
+            weight = self._get_weight(key)
+            if weight is not None:
+                loss = loss + weight * out[key]
+
+        key = "loss_event"
+        weight = self._get_weight(key)
+        if weight is not None:
+            T = out["pred_phi"].size(-1)
+            loss_event = nll_logistic_hazard(
+                out["pred_phi"].view(-1, T), batch["duration_inds"], batch["event_inds"]
+            )
+            loss = loss + weight * loss_event
+            out["loss_event"] = loss_event
+        out["loss"] = loss
         return out
 
     def training_step(self, batch, batch_idx):
         out = self(batch)
         out = self.compute_loss(out, batch)
         batch_size = batch["batch_size"]
+
         self.log(
             "train_loss",
             out["loss"],
@@ -135,20 +103,14 @@ class LitTemporalTransformer(pl.LightningModule):
         self.val_preds.append(pred_cls)
         self.val_targets.append(labels)
 
-        self.log(
-            "val_loss_cls",
-            out["loss_cls"],
-            prog_bar=True,
-            on_epoch=True,
-            batch_size=batch_size,
-        )
-        self.log(
-            "val_loss_pc",
-            out["loss_pc"],
-            prog_bar=True,
-            on_epoch=True,
-            batch_size=batch_size,
-        )
+        for key in ["loss", "loss_cls", "loss_pc"]:
+            self.log(
+                f"val_{key}",
+                out[key],
+                prog_bar=True,
+                on_epoch=True,
+                batch_size=batch_size,
+            )
 
         return out["loss"]
 
@@ -209,30 +171,37 @@ def build_encounters(df, pid2demo, pid2event_info):
     encounters_all = []
     eventtime_all = []
 
-    for (p,), d in df.groupby(["PERSON_ID"]):
+    # Organize rows by PERSON_ID and age_quarter
+    pid_age2rows = {}
+    for row in df.itertuples(index=False):
+        pid = row.PERSON_ID
+        age = row.age_quarter
+        if pid not in pid_age2rows:
+            pid_age2rows[pid] = {}
+        if age not in pid_age2rows[pid]:
+            pid_age2rows[pid][age] = []
+        pid_age2rows[pid][age].append(row)
+
+    for pid, age_dict in pid_age2rows.items():
         encounters = []
-        last_t = 0
-        for t, k in d.groupby("age_quarter"):
-            fea_dyn = dict(zip(k.MEASUREMENT_CONCEPT_ID, k.norm_value))
-            fea_dyn["age"] = t / 400
+        for age in sorted(age_dict.keys()):
+            rows = age_dict[age]
 
-            fea_static = {}
-            if p in pid2demo:
-                fea_static = pid2demo[p]
+            # Dynamic features
+            fea_dyn = {r.MEASUREMENT_CONCEPT_ID: r.norm_value for r in rows}
+            fea_dyn["age"] = age / 400
 
+            # Static features
+            fea_static = pid2demo.get(pid, {})
+
+            # Combine features
             fea_input = {**fea_dyn, **fea_static}
-            # fea_input = fea_dyn
             fea_rec = fea_dyn
-            encounters.append({"time": t, "inputs": fea_input, "outputs": fea_rec})
-            last_t = max(last_t, t)
 
-        encounters = sorted(encounters, key=lambda x: x["time"])
+            encounters.append({"time": age, "inputs": fea_input, "outputs": fea_rec})
+
         encounters_all.append(encounters)
-
-        event_info = {}
-        if p in pid2event_info:
-            event_info = pid2event_info[p]
-        eventtime_all.append(event_info)
+        eventtime_all.append(pid2event_info.get(pid, {}))
 
     return encounters_all, eventtime_all
 
@@ -252,12 +221,16 @@ def build_vocab(encounters, key="inputs", add_cls_pad=True):
 
 
 def get_pid2event_info(df):
-    grouped = df.groupby(["PERSON_ID", "category"])["age_quarter"].unique()
     pid2event_info = {}
-    for (pid, cat), values in grouped.items():
+    for row in df.itertuples(index=False):
+        pid = row.PERSON_ID
+        cat = row.category
+        age = row.age_quarter
         if pid not in pid2event_info:
             pid2event_info[pid] = {}
-        pid2event_info[pid][cat] = set(values.tolist())
+        if cat not in pid2event_info[pid]:
+            pid2event_info[pid][cat] = set()
+        pid2event_info[pid][cat].add(age)
     return pid2event_info
 
 
@@ -276,17 +249,21 @@ def build_loaders(
     df_demo,
     df_code,
     batch_size_train=64,
-    batch_size_eval=16,
+    batch_size_eval=64,
     train_size=0.7,
     random_state=1,
-    num_workers=16,
+    num_workers=32,
     p_drop_encounter=0.9,
     p_drop_meas=0.9,
 ):
     """
     Build vocabularies, split data, create datasets, and return dataloaders.
-    Minimizes input variables from the user.
     """
+
+    person_ids = set(df.PERSON_ID)
+    df_demo = df_demo.loc[df_demo.PERSON_ID.isin(person_ids)]
+    df_code = df_code.loc[df_code.PERSON_ID.isin(person_ids)]
+
     pid2event_info = get_pid2event_info(df_code)
     pid2demo = get_pid2demo(df_demo)
 
@@ -307,7 +284,6 @@ def build_loaders(
     assert len(diff) == 0, f"{diff} not in train outputs"
     # ----- Label mapping -----
     id2phecode = sorted([s for s in set(df_code.category) if s != "LAST_REC"])
-
     # ----- Datasets -----
     train_dataset = EventTimeDataset(
         train_enc,
@@ -360,48 +336,62 @@ def build_loaders(
     }
 
 
-if __name__ == "__main__":
-    df = pd.read_parquet("./train_cbc_v1.parquet")
-    df_demo = pd.read_parquet("./train_demo_cbc_v1.parquet")
-    df_code = pd.read_parquet("./train_cbc_outcome_last_v1.parquet")
+@hydra.main(version_base=None, config_path="../conf", config_name="config")
+def main(cfg: DictConfig):
+    print("Loaded configuration:\n", OmegaConf.to_yaml(cfg))
+
+    # Load datasets
+    df = pd.read_parquet(cfg.data.df_path)
+    df_demo = pd.read_parquet(cfg.data.df_demo_path)
+    df_code = pd.read_parquet(cfg.data.df_code_path)
 
     datasets_info = build_loaders(
         df,
         df_demo,
         df_code,
-        p_drop_meas=0.8,
-        p_drop_encounter=0.5,
+        p_drop_meas=cfg.drop.p_drop_meas,
+        p_drop_encounter=cfg.drop.p_drop_encounter,
     )
+
     train_loader = datasets_info["train_loader"]
     val_loader = datasets_info["val_loader"]
     test_loader = datasets_info["test_loader"]
 
-    dim_cls = len(datasets_info["id2phecode"])
-    dim_rec = len(datasets_info["output_vocabs"])
+    # model config
+    model_cfg = cfg.model
+    model_cfg.dim_cls = len(datasets_info["id2phecode"])
+    model_cfg.dim_out = len(datasets_info["output_vocabs"])
 
     model = LitTemporalTransformer(
-        L=128,
-        d_model=128,
-        nhead=16,
-        dim_out=dim_rec,
-        dim_cls=dim_cls,
+        loss_weights={"loss_event": 1, "loss_pc": 1, "loss_rec": 1},
+        model_config=model_cfg,
     )
 
+    os.makedirs(cfg.trainer.root_dir, exist_ok=True)
+    ckpt_dir = f"{cfg.trainer.root_dir}/checkpoints"
+
+    # Checkpoint callback
     checkpoint_cb = ModelCheckpoint(
-        monitor="val_auroc",
+        dirpath=ckpt_dir,
+        monitor=cfg.trainer.monitor_metric,
         mode="max",
         save_top_k=1,
         save_last=False,
-        filename="best-auroc",
+        filename=cfg.trainer.checkpoint_name,
     )
 
+    # Trainer
     trainer = pl.Trainer(
-        max_epochs=20,
-        accelerator="gpu",  # or "cpu"
-        devices=1,
+        default_root_dir=cfg.trainer.root_dir,
+        max_epochs=cfg.trainer.max_epochs,
+        accelerator=cfg.trainer.accelerator,
+        devices=cfg.trainer.devices,
         callbacks=[checkpoint_cb],
-        # gradient_clip_val=1.0,
     )
 
     trainer.fit(model, train_loader, val_dataloaders=val_loader)
     trainer.test(model, dataloaders=test_loader, ckpt_path="best")
+
+
+if __name__ == "__main__":
+    main()

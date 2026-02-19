@@ -1,13 +1,66 @@
 import pandas as pd
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from pytorch_lightning.callbacks import ModelCheckpoint
+from torch import Tensor
 from torch.utils.data import DataLoader
 from torchmetrics.functional import auroc
 
-from src.data_utils import EventTimeDataset, build_vocab
-from src.models import TemporalTransformer
+from data_utils import EventTimeDataset
+from models import TemporalTransformer
+
+
+def _reduction(loss: Tensor, reduction: str = "mean") -> Tensor:
+    if reduction == "none":
+        return loss
+    elif reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    raise ValueError(
+        f"`reduction` = {reduction} is not valid. Use 'none', 'mean' or 'sum'."
+    )
+
+
+def nll_logistic_hazard(
+    phi: Tensor, idx_durations: Tensor, events: Tensor, reduction: str = "mean"
+) -> Tensor:
+    """Negative log-likelihood of the discrete time hazard parametrized model LogisticHazard [1].
+
+    Arguments:
+        phi [B, num_bin] {torch.tensor, float} -- Estimates in (-inf, inf), where hazard = sigmoid(phi).
+
+        idx_durations [B], {torch.tensor, long} -- Event times represented as indices.
+        events [B], {torch.tensor, float} -- Indicator of event (1.) or censoring (0.).
+            Same length as 'idx_durations'.
+        reduction {string} -- How to reduce the loss.
+            'none': No reduction.
+            'mean': Mean of tensor.
+            'sum: sum.
+
+    Returns:
+        torch.tensor -- The negative log-likelihood.
+
+    References:
+    [1] Håvard Kvamme and Ørnulf Borgan. Continuous and Discrete-Time Survival Prediction
+        with Neural Networks. arXiv preprint arXiv:1910.06724, 2019.
+        https://arxiv.org/pdf/1910.06724.pdf
+    """
+    if phi.shape[1] <= idx_durations.max():
+        message = "Network output `phi` is too small for `idx_durations`. "
+        message += f"Need at least `phi.shape[1] = {idx_durations.max().item()+1}`, "
+        message += f"but got `phi.shape[1] = {phi.shape[1]}`"
+        raise ValueError(message)
+    if events.dtype is torch.bool:
+        events = events.float()
+    events = events.view(-1, 1)
+    idx_durations = idx_durations.view(-1, 1)
+    y_bce = torch.zeros_like(phi).scatter(1, idx_durations, events)
+    bce = F.binary_cross_entropy_with_logits(phi, y_bce, reduction="none")
+    loss = bce.cumsum(1).gather(1, idx_durations).view(-1)
+    return _reduction(loss, reduction)
 
 
 class LitTemporalTransformer(pl.LightningModule):
@@ -23,9 +76,17 @@ class LitTemporalTransformer(pl.LightningModule):
 
     def compute_loss(self, out, batch):
         loss_cls = self.criterion(out["pred_cls"], batch["labels"])
+        T = out["pred_phi"].size(-1)
+        loss_event = nll_logistic_hazard(
+            out["pred_phi"].view(-1, T), batch["duration_inds"], batch["event_inds"]
+        )
+
         loss = loss_cls + 1.0 * out["loss_pc"] + 1.0 * out["loss_rec"]
+        loss += 1.0 * loss_event
+
         out["loss"] = loss
         out["loss_cls"] = loss_cls
+        out["loss_event"] = loss_event
         return out
 
     def training_step(self, batch, batch_idx):
@@ -50,6 +111,13 @@ class LitTemporalTransformer(pl.LightningModule):
         self.log(
             "train_loss_pc",
             out["loss_pc"],
+            prog_bar=True,
+            on_epoch=True,
+            batch_size=batch_size,
+        )
+        self.log(
+            "train_loss_event",
+            out["loss_event"],
             prog_bar=True,
             on_epoch=True,
             batch_size=batch_size,
@@ -169,6 +237,20 @@ def build_encounters(df, pid2demo, pid2event_info):
     return encounters_all, eventtime_all
 
 
+def build_vocab(encounters, key="inputs", add_cls_pad=True):
+    names = set()
+    for es in encounters:
+        for e in es:
+            names.update(e[key].keys())
+    if add_cls_pad:
+        measurement_vocab = {name: i + 2 for i, name in enumerate(sorted(names))}
+        measurement_vocab["<CLS>"] = 1
+        measurement_vocab["<PAD>"] = 0
+    else:
+        measurement_vocab = {name: i for i, name in enumerate(sorted(names))}
+    return measurement_vocab
+
+
 def get_pid2event_info(df):
     grouped = df.groupby(["PERSON_ID", "category"])["age_quarter"].unique()
     pid2event_info = {}
@@ -224,7 +306,7 @@ def build_loaders(
     diff = set(_vocab.keys()) - set(output_vocabs.keys())
     assert len(diff) == 0, f"{diff} not in train outputs"
     # ----- Label mapping -----
-    id2phecode = sorted(set(df_code.category))
+    id2phecode = sorted([s for s in set(df_code.category) if s != "LAST_REC"])
 
     # ----- Datasets -----
     train_dataset = EventTimeDataset(
@@ -281,14 +363,14 @@ def build_loaders(
 if __name__ == "__main__":
     df = pd.read_parquet("./train_cbc_v1.parquet")
     df_demo = pd.read_parquet("./train_demo_cbc_v1.parquet")
-    df_code = pd.read_parquet("./train_cbc_outcome_v1.parquet")
+    df_code = pd.read_parquet("./train_cbc_outcome_last_v1.parquet")
 
     datasets_info = build_loaders(
         df,
         df_demo,
         df_code,
         p_drop_meas=0.8,
-        p_drop_encounter=0.9,
+        p_drop_encounter=0.5,
     )
     train_loader = datasets_info["train_loader"]
     val_loader = datasets_info["val_loader"]
@@ -299,8 +381,8 @@ if __name__ == "__main__":
 
     model = LitTemporalTransformer(
         L=128,
-        d_model=64,
-        nhead=8,
+        d_model=128,
+        nhead=16,
         dim_out=dim_rec,
         dim_cls=dim_cls,
     )

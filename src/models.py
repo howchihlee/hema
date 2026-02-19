@@ -47,7 +47,7 @@ class TemporalTransformer(nn.Module):
 
         self.pred_emb = nn.Parameter(torch.randn(1, 1, d_model))
         self.val_emb = nn.Parameter(torch.randn(1, 1, d_model))
-        self.cls_emb = nn.Parameter(torch.randn(1, 1, d_model))
+        self.cls_emb = nn.Parameter(torch.randn(1, dim_cls, d_model))
 
         enc_layer_visit = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -57,9 +57,12 @@ class TemporalTransformer(nn.Module):
 
         self.traj_encoder = nn.TransformerEncoder(enc_layer_visit, num_layers=2)
 
+        dim_tmax = 120
         self.f_obs = nn.Linear(d_model, dim_out)
-        self.f_cls = nn.Linear(d_model, dim_cls)
+        self.f_cls = nn.Linear(d_model, dim_tmax + 1)
         self.dim_out = dim_out
+        self.dim_cls = dim_cls
+        self.dim_tmax = dim_tmax
 
     def forward(self, batch, return_outputmask=False, compute_pc_loss=True):
         """
@@ -96,7 +99,7 @@ class TemporalTransformer(nn.Module):
         )
 
         # --- Masking ---
-        dims = (B, 2 * seq_time)
+        dims = (B, 2 * seq_time + self.dim_cls)
         mask_per_patient = torch.ones(dims, device=device, dtype=torch.bool)
         mask_per_patient = pivot_tensor(
             mask_per_patient,
@@ -104,6 +107,7 @@ class TemporalTransformer(nn.Module):
             batch["time_ids"],
             [False, False],
         )
+        mask_per_patient[:, -self.dim_cls :] = False
 
         # --- per patient embedding
         dims = (B, 2 * seq_time, self.d_model)
@@ -153,31 +157,37 @@ class TemporalTransformer(nn.Module):
 
         # Causal mask
         causal_mask = torch.triu(
-            torch.ones(2 * seq_time + 1, 2 * seq_time + 1, device=device), diagonal=1
+            torch.ones(
+                2 * seq_time + self.dim_cls, 2 * seq_time + self.dim_cls, device=device
+            ),
+            diagonal=1,
         ).bool()
+        causal_mask[-self.dim_cls :] = False
 
         cls_token = self.cls_emb.expand(B, -1, -1)
         out_per_patient_cls = torch.cat(
             [out_per_patient, cls_token], dim=1
-        )  # [B, S+1, D]
-        cls_mask = torch.ones(B, 1, dtype=mask_per_patient.dtype, device=device)
-        pad_mask_with_cls = torch.cat([mask_per_patient, cls_mask], dim=1)  # [B, S+1]
+        )  # [B, 2S + dim_cls, D]
+        # cls_mask = torch.ones(B, self.dim_cls, dtype=mask_per_patient.dtype, device=device)
+        # pad_mask_with_cls = torch.cat([mask_per_patient, cls_mask], dim=1)  # [B, S+1]
 
         out2 = self.traj_encoder(
             out_per_patient_cls,
             mask=causal_mask,
-            src_key_padding_mask=pad_mask_with_cls,
-            is_causal=True,
+            src_key_padding_mask=mask_per_patient,
         )
 
         # Predictions
-        pred = self.f_obs(out2[:, :-1])  # (B, 2*seq_time, dim_out)
-        last_embs = out2[:, -1]
-        pred_cls = self.f_cls(last_embs)
+        pred = self.f_obs(out2[:, : -self.dim_cls])  # (B, 2*seq_time, dim_out)
+        last_embs = out2[:, -self.dim_cls :]
+        pred_event = self.f_cls(last_embs)  # (B, dim_cls, dim_tmax + 1)
+        pred_cls = pred_event[:, :, 0]
+        pred_phi = pred_event[:, :, 1:]
 
         outputs = {
             "pred_rec": pred,
             "pred_cls": pred_cls,
+            "pred_phi": pred_phi,
             "embeddings": out2,
         }
 

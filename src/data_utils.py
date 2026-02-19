@@ -6,20 +6,6 @@ from sklearn.preprocessing import FunctionTransformer, QuantileTransformer
 from torch.utils.data import Dataset
 
 
-def build_vocab(encounters, key="inputs", add_cls_pad=True):
-    names = set()
-    for es in encounters:
-        for e in es:
-            names.update(e[key].keys())
-    if add_cls_pad:
-        measurement_vocab = {name: i + 2 for i, name in enumerate(sorted(names))}
-        measurement_vocab["<CLS>"] = 1
-        measurement_vocab["<PAD>"] = 0
-    else:
-        measurement_vocab = {name: i for i, name in enumerate(sorted(names))}
-    return measurement_vocab
-
-
 def create_pipeline():
     return Pipeline(
         [
@@ -83,7 +69,7 @@ class EventTimeDataset(Dataset):
 
         self.measurement_vocab = measurement_vocab
         self.rec_vocabs = rec_vocabs
-
+        self.tmax = 119
         self.pad_token = self.measurement_vocab["<PAD>"]
         self.cls_token = self.measurement_vocab["<CLS>"]
 
@@ -116,12 +102,28 @@ class EventTimeDataset(Dataset):
 
     def parse_events(self, event_info, t0, t1):
         labels = []
+        durations = []
+        event_inds = []
         for d in self.event_keys:
             label = 0
+            times = []
             if d in event_info:
                 label = self.is_in_between(event_info[d], t0 - 4, t1 + 4)
-            labels += [label]
-        return {"labels": labels}
+                times = [t for t in event_info[d] if t > t1]
+
+            event_ind = int(len(times) > 0)  # event indicator
+            if event_ind:
+                obs_time = min(times)
+            else:
+                assert max(event_info["LAST_REC"]) >= t1
+                obs_time = max(event_info["LAST_REC"])
+            obs_time = min(obs_time - t1, self.tmax)
+
+            labels.append(label)
+            event_inds.append(event_ind)
+            durations.append(obs_time)
+
+        return {"labels": labels, "event_inds": event_inds, "duration_inds": durations}
 
     def is_in_between(self, nums, t0, t1):
         return int(any(t0 <= n <= t1 for n in nums))
@@ -174,13 +176,15 @@ class EventTimeDataset(Dataset):
         """
 
         keys = batch[0]["outputs"].keys()
+
         event_outputs = {}
         for k in keys:
             event_outputs[k] = torch.tensor(
                 [item["outputs"][k] for item in batch], dtype=torch.float
             )
-        # event_inds = torch.tensor([item['event_ind'] for item in batch], dtype = torch.float)
-        # event_times = torch.tensor([item['event_time'] for item in batch], dtype = torch.long)
+
+        if "duration_inds" in event_outputs:
+            event_outputs["duration_inds"] = event_outputs["duration_inds"].long()
 
         flattened_batch = [i for item in batch for i in item["inputs"]]
         sample_ids = [id for id, item in enumerate(batch) for i in item["inputs"]]
